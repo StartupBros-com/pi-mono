@@ -233,6 +233,9 @@ export function convertMessages<T extends GoogleApiType>(model: Model<T>, contex
  * anyOf, oneOf, const, etc.). Set `useParameters` to true to use the legacy `parameters`
  * field instead (OpenAPI 3.03 Schema). This is needed for Cloud Code Assist with Claude
  * models, where the API translates `parameters` into Anthropic's `input_schema`.
+ *
+ * When `useParameters` is true, schemas are sanitized to remove JSON Schema features
+ * unsupported by OpenAPI 3.03 (const, patternProperties, anyOf with const values).
  */
 export function convertTools(
 	tools: Tool[],
@@ -244,10 +247,67 @@ export function convertTools(
 			functionDeclarations: tools.map((tool) => ({
 				name: tool.name,
 				description: tool.description,
-				...(useParameters ? { parameters: tool.parameters } : { parametersJsonSchema: tool.parameters }),
+				...(useParameters
+					? { parameters: sanitizeSchemaForOpenApi(tool.parameters) }
+					: { parametersJsonSchema: tool.parameters }),
 			})),
 		},
 	];
+}
+
+/**
+ * Recursively sanitize a JSON Schema object for OpenAPI 3.03 compatibility.
+ *
+ * Converts JSON Schema constructs that are unsupported by Google's Cloud Code Assist
+ * `parameters` field:
+ * - `anyOf` / `oneOf` with `{const: value}` entries → `enum` array
+ * - standalone `const` → `enum` with single value
+ * - `patternProperties` → stripped (no OpenAPI equivalent)
+ */
+function sanitizeSchemaForOpenApi(schema: unknown): unknown {
+	if (schema === null || schema === undefined || typeof schema !== "object") {
+		return schema;
+	}
+
+	if (Array.isArray(schema)) {
+		return schema.map(sanitizeSchemaForOpenApi);
+	}
+
+	const obj = schema as Record<string, unknown>;
+	const result: Record<string, unknown> = {};
+
+	for (const [key, value] of Object.entries(obj)) {
+		// Strip patternProperties — no OpenAPI equivalent
+		if (key === "patternProperties") {
+			continue;
+		}
+
+		// Convert anyOf/oneOf with const entries to enum
+		if ((key === "anyOf" || key === "oneOf") && Array.isArray(value)) {
+			const constValues = value
+				.filter(
+					(item): item is Record<string, unknown> => typeof item === "object" && item !== null && "const" in item,
+				)
+				.map((item) => item.const);
+
+			if (constValues.length === value.length && constValues.length > 0) {
+				// biome-ignore lint/complexity/useLiteralKeys: "enum" is a reserved word
+				result["enum"] = constValues;
+				continue;
+			}
+		}
+
+		// Convert standalone const to single-value enum
+		if (key === "const") {
+			// biome-ignore lint/complexity/useLiteralKeys: "enum" is a reserved word
+			result["enum"] = [value];
+			continue;
+		}
+
+		result[key] = sanitizeSchemaForOpenApi(value);
+	}
+
+	return result;
 }
 
 /**
